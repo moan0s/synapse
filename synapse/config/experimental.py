@@ -54,3 +54,8 @@ class ExperimentalConfig(Config):
         self.msc3202_device_masquerading_enabled: bool = experimental.get(
             "msc3202_device_masquerading", False
         )
+
+        # MSC2775 (lazy load members on federation join)
+        self.msc2775_server_enabled: bool = experimental.get(
+            "msc2775_server_enabled", False
+        )
