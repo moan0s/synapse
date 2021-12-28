@@ -22,6 +22,7 @@ from typing import (
     List,
     Optional,
     Tuple,
+    TypeVar,
     Union,
     cast,
 )
@@ -51,6 +52,45 @@ if TYPE_CHECKING:
     from synapse.server import HomeServer
 
 logger = logging.getLogger(__name__)
+
+
+# Key and Value type for the cache
+KT = TypeVar("KT")
+VT = TypeVar("VT")
+
+
+def _get_results_from_cache(
+    cache: LruCache[KT, VT], keys: Iterable[KT]
+) -> Tuple[Dict[KT, VT], List[KT]]:
+    """
+    Partition keys for a cache based on whether data is found in the cache or not.
+
+    A cached value of None is not returned, but also not considered missing.
+
+    Args:
+        cache: The cache to check against.
+        keys: An iterable of keys to search for.
+
+    Returns:
+        A tuple of:
+            A dictionary which maps keys found in the cache to their value.
+
+            A list of keys missing from the cache.
+    """
+    # A map of the original event IDs to the edit events.
+    cached_results = {}
+
+    # Check if data for this key is currently cached.
+    missing_results = []
+    for key in keys:
+        if key not in cache:
+            missing_results.append(key)
+        else:
+            result = cache[key]
+            if result is not None:
+                cached_results[key] = result
+
+    return cached_results, missing_results
 
 
 class RelationsWorkerStore(SQLBaseStore):
@@ -348,18 +388,11 @@ class RelationsWorkerStore(SQLBaseStore):
             there is no edits.
         """
 
-        # A map of the original event IDs to the edit events.
-        edits_by_original = {}
-
-        # Check if an edit for this event is currently cached.
-        event_ids_to_check = []
-        for event_id in event_ids:
-            if event_id not in self.get_applicable_edit:
-                event_ids_to_check.append(event_id)
-            else:
-                edit_event = self.get_applicable_edit[event_id]
-                if edit_event:
-                    edits_by_original[event_id] = edit_event
+        # Partition the requested event IDs into cached vs. un-cached keys.
+        edits_by_original, event_ids_to_check = cast(
+            Tuple[Dict[str, EventBase], List[str]],
+            _get_results_from_cache(self.get_applicable_edit, event_ids),
+        )
 
         # If all events were cached, all done.
         if not event_ids_to_check:
