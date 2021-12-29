@@ -109,6 +109,12 @@ class RelationsWorkerStore(SQLBaseStore):
             cache_name="get_applicable_edit",
             max_size=hs.config.caches.event_cache_size,  # TODO
         )
+        self.get_thread_summary: LruCache[
+            str, Optional[Tuple[int, EventBase]]
+        ] = LruCache(
+            cache_name="get_thread_summary",
+            max_size=hs.config.caches.event_cache_size,  # TODO
+        )
 
     @cached(tree=True)
     async def get_relations_for_event(
@@ -456,69 +462,93 @@ class RelationsWorkerStore(SQLBaseStore):
 
         return edits_by_original
 
-    @cached()
-    async def get_thread_summary(
-        self, event_id: str
-    ) -> Tuple[int, Optional[EventBase]]:
+    async def _get_thread_summaries(
+        self, event_ids: Iterable[str]
+    ) -> Dict[str, Tuple[int, EventBase]]:
         """Get the number of threaded replies, the senders of those replies, and
         the latest reply (if any) for the given event.
 
         Args:
-            event_id: Summarize the thread related to this event ID.
+            event_ids: Summarize the thread related to this event ID.
 
         Returns:
-            The number of items in the thread and the most recent response, if any.
+            A map of the thread summary each event. A missing event implies there
+            are no threaded replies.
+
+            Each summary includes the number of items in the thread and the most
+            recent response.
         """
+
+        # Partition the requested event IDs into cached vs. un-cached keys.
+        summaries, event_ids_to_check = cast(
+            Tuple[Dict[str, Tuple[int, EventBase]], List[str]],
+            _get_results_from_cache(self.get_thread_summary, event_ids),
+        )
+
+        # If all events were cached, all done.
+        if not event_ids_to_check:
+            return summaries
 
         def _get_thread_summary_txn(
             txn: LoggingTransaction,
-        ) -> Tuple[int, Optional[str]]:
+        ) -> Tuple[Dict[str, int], Dict[str, str]]:
             # Fetch the count of threaded events and the latest event ID.
             # TODO Should this only allow m.room.message events.
             sql = """
-                SELECT child.event_id FROM events AS child
+                SELECT parent.event_id, child.event_id FROM events AS child
                 INNER JOIN event_relations USING (event_id)
                 INNER JOIN events AS parent ON
                     parent.event_id = relates_to_id
                     AND parent.room_id = child.room_id
                 WHERE
-                    relates_to_id = ?
+                    %s
                     AND relation_type = ?
                 ORDER BY child.topological_ordering DESC, child.stream_ordering DESC
-                LIMIT 1
             """
 
-            txn.execute(sql, (event_id, RelationTypes.THREAD))
-            row = txn.fetchone()
-            if row is None:
-                return 0, None
+            clause, args = make_in_list_sql_clause(
+                txn.database_engine, "relates_to_id", event_ids_to_check
+            )
+            args.append(RelationTypes.THREAD)
 
-            latest_event_id = row[0]
+            txn.execute(sql % (clause,), args)
+            latest_event_ids = {}
+            for parent_event_id, child_event_id in txn.fetchall():
+                # Only consider the latest threaded reply (by topological ordering).
+                if parent_event_id not in latest_event_ids:
+                    latest_event_ids[parent_event_id] = child_event_id
 
             sql = """
-                SELECT COUNT(child.event_id) FROM events AS child
+                SELECT parent.event_id, COUNT(child.event_id) FROM events AS child
                 INNER JOIN event_relations USING (event_id)
                 INNER JOIN events AS parent ON
                     parent.event_id = relates_to_id
                     AND parent.room_id = child.room_id
                 WHERE
-                    relates_to_id = ?
+                    %s
                     AND relation_type = ?
             """
-            txn.execute(sql, (event_id, RelationTypes.THREAD))
-            count = cast(Tuple[int], txn.fetchone())[0]
+            txn.execute(sql % (clause,), args)
+            counts: Dict[str, int] = dict(cast(List[Tuple[str, int]], txn.fetchall()))
 
-            return count, latest_event_id
+            return counts, latest_event_ids
 
-        count, latest_event_id = await self.db_pool.runInteraction(
+        counts, latest_event_ids = await self.db_pool.runInteraction(
             "get_thread_summary", _get_thread_summary_txn
         )
 
-        latest_event = None
-        if latest_event_id:
+        for parent_event_id, latest_event_id in latest_event_ids.items():
             latest_event = await self.get_event(latest_event_id, allow_none=True)  # type: ignore[attr-defined]
 
-        return count, latest_event
+            # If there's no latest event, ignore the entry, but cache that nothing
+            # was found.
+            summary = None
+            if latest_event:
+                summary = (counts[parent_event_id], latest_event)
+                summaries[parent_event_id] = summary
+            self.get_thread_summary.set(parent_event_id, summary)
+
+        return summaries
 
     async def events_have_relations(
         self,
@@ -668,11 +698,10 @@ class RelationsWorkerStore(SQLBaseStore):
 
         # If this event is the start of a thread, include a summary of the replies.
         if self._msc3440_enabled:
-            (
-                thread_count,
-                latest_thread_event,
-            ) = await self.get_thread_summary(event_id)
-            if latest_thread_event:
+            summaries = await self._get_thread_summaries([event_id])
+            summary = summaries.get(event_id)
+            if summary:
+                thread_count, latest_thread_event = summary
                 aggregations[RelationTypes.THREAD] = {
                     # Don't bundle aggregations as this could recurse forever.
                     "latest_event": latest_thread_event,
