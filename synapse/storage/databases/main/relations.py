@@ -696,18 +696,6 @@ class RelationsWorkerStore(SQLBaseStore):
         if references.chunk:
             aggregations[RelationTypes.REFERENCE] = references.to_dict()
 
-        # If this event is the start of a thread, include a summary of the replies.
-        if self._msc3440_enabled:
-            summaries = await self._get_thread_summaries([event_id])
-            summary = summaries.get(event_id)
-            if summary:
-                thread_count, latest_thread_event = summary
-                aggregations[RelationTypes.THREAD] = {
-                    # Don't bundle aggregations as this could recurse forever.
-                    "latest_event": latest_thread_event,
-                    "count": thread_count,
-                }
-
         # Store the bundled aggregations in the event metadata for later use.
         return aggregations
 
@@ -736,6 +724,16 @@ class RelationsWorkerStore(SQLBaseStore):
         edits = await self._get_applicable_edits(event_ids)
         for event_id, edit in edits.items():
             results.setdefault(event_id, {})[RelationTypes.REPLACE] = edit
+
+        # Fetch thread summaries.
+        if self._msc3440_enabled:
+            summaries = await self._get_thread_summaries(event_ids)
+            for event_id, summary in summaries.items():
+                thread_count, latest_thread_event = summary
+                results.setdefault(event_id, {})[RelationTypes.THREAD] = {
+                    "latest_event": latest_thread_event,
+                    "count": thread_count,
+                }
 
         # Fetch other relations per event.
         for event in events:
